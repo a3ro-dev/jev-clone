@@ -1,0 +1,40 @@
+[project]
+name = "jevc"
+version = "0.1.0"
+description = "Open Jev-style decision model: evaluation pipeline (Milestone 1A)"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "gliclass==0.1.20",
+    "transformers==5.17.0",
+    "torch==2.14.0",
+    "datasets==5.0.1",
+    "numpy>=2.0",
+    "psutil>=6.0",
+]
+
+[project.scripts]
+jevc = "jevc.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/jevc"]
+
+# Windows: PyPI torch is CPU-only, so take cu130 wheels from the PyTorch index (local driver reports CUDA 13.4).
+# Linux (Runpod): the default PyPI torch 2.14.0 wheel already bundles CUDA 13 (nvidia-*-cu13 deps); pick a pod
+# whose driver supports CUDA 13.0+ (Runpod's CUDA-version filter).
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'win32'" }]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
