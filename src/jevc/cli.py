@@ -114,6 +114,50 @@ def cmd_run(a):
     print(f"wrote {out.relative_to(ROOT)}")
 
 
+def cmd_audit(a):
+    """Compare documented and alternative GLiClass input representations on dev data."""
+    from . import infer
+
+    out = ROOT / "reports" / a.run_id
+    assert not out.exists(), f"run dir exists: {out}"
+    out.mkdir(parents=True)
+    fams = {f: load_items(ingest.EVAL_DIR / f / "dev.jsonl") for f in ("boolq", "clinc")}
+    rt = infer.load_runtime(a.device)
+    modes = infer.INPUT_MODES
+    records, result = [], {"modes": list(modes), "families": {}}
+    for family, items in fams.items():
+        result["families"][family] = {}
+        for mode in modes:
+            full = infer.run_items(rt, items, "full", a.batch_size, mode)
+            reordered = infer.run_items(rt, items, "reordered", a.batch_size, mode)
+            records.extend(full + reordered)
+            summary = metrics.summary(full)
+            result["families"][family][mode] = {
+                "summary": summary,
+                "reorder_invariance": metrics.invariance(full, reordered),
+            }
+    run = {"run_id": a.run_id, "mode": "adapter_audit", "model": infer.MODEL_ID,
+           "model_revision": infer.MODEL_REVISION, "input_modes": list(modes),
+           "batch_size": a.batch_size, "env": _env(rt), "code_commit": _git("rev-parse", "HEAD")}
+    write_jsonl(out / "predictions.jsonl", records)
+    (out / "metrics.json").write_text(json.dumps(result, indent=1), encoding="utf-8")
+    lines = [f"# GLiClass adapter audit — `{a.run_id}`", "",
+             "Development-only comparison. All modes use the same untouched checkpoint and items.", "",
+             "| family | input mode | accuracy | macro F1 | log loss | Brier | reorder agreement |", "|---|---|---:|---:|---:|---:|---:|"]
+    for family, modes_result in result["families"].items():
+        for mode, values in modes_result.items():
+            summary, inv = values["summary"], values["reorder_invariance"]
+            lines.append(f"| {family} | {mode} | {summary['accuracy']:.3f} | {summary['macro_f1']:.3f} | "
+                         f"{summary['log_loss']:.3f} | {summary['brier']:.3f} | {inv['pred_agreement']:.3f} |")
+    lines += ["", "Modes:", "", "- `official_labels`: state text with official-style terse labels.",
+              "- `described_text`: current baseline; option descriptions injected into text, terse labels retained.",
+              "- `described_labels`: state text with natural-language descriptions as labels.",
+              "- `pairwise_descriptions`: each option scored in isolation then normalized; an order-interaction diagnostic, not a calibrated joint distribution."]
+    (out / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (out / "run.json").write_text(json.dumps(run, indent=1), encoding="utf-8")
+    print(f"wrote {out.relative_to(ROOT)}")
+
+
 def _f(x):
     return "n/a" if x is None or x != x else f"{x:.3f}"
 
@@ -191,6 +235,11 @@ def main(argv=None):
     r.add_argument("--n-boot", type=int, default=1000)
     r.add_argument("--no-probe", action="store_true")
     r.set_defaults(fn=cmd_run)
+    audit = sub.add_parser("audit", help="compare GLiClass input representations on development data")
+    audit.add_argument("--run-id", required=True)
+    audit.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
+    audit.add_argument("--batch-size", type=int, default=8)
+    audit.set_defaults(fn=cmd_audit)
     a = ap.parse_args(argv)
     a.fn(a)
 

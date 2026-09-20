@@ -29,12 +29,21 @@ def test_build_text_places_descriptions_before_state():
     assert infer.build_text("", item().options) == "smart home: control a device alarm: set an alarm timer: set a timer"
 
 
+def test_input_modes_keep_model_visible_semantics_explicit():
+    opts = item().options
+    assert infer.model_labels(opts, "official_labels") == ["smart home", "alarm", "timer"]
+    assert infer.model_labels(opts, "described_text") == ["smart home", "alarm", "timer"]
+    assert infer.model_labels(opts, "described_labels") == [o.description for o in opts]
+    assert infer.build_text("STATE", opts, "official_labels") == "STATE"
+    assert infer.build_text("STATE", opts, "pairwise_descriptions") == "STATE"
+
+
 def test_probs_map_back_to_option_ids_under_reordering():
     """Fake scorer: logit for an option depends only on its identity, so probabilities must be identical after reordering."""
     it = item()
     logit_by_id = {"smart_home": 2.0, "alarm": 0.0, "timer": -1.0}
 
-    def fake_score(rt, views):
+    def fake_score(rt, views, input_mode="described_text"):
         out = []
         for _, _, opts in views:
             p = torch.softmax(torch.tensor([logit_by_id[o.id] for o in opts]), -1).tolist()

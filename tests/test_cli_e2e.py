@@ -13,7 +13,7 @@ class FakeRuntime:
     dtype = "fake"
 
 
-def fake_score(rt, views):
+def fake_score(rt, views, input_mode="described_text"):
     out = []
     for q, state, opts in views:  # deterministic: prefer the option whose label shares the most words with the state
         scores = torch.tensor([float(len(set(o.label.split()) & set(state.lower().split()))) + 1e-6 * (int(hashlib.sha1(o.id.encode()).hexdigest(), 16) % 100003) for o in opts])  # order-independent, tie-free

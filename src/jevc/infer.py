@@ -63,15 +63,32 @@ def variant_view(item: Item, variant: str) -> tuple[str, str, list[Option]]:
     raise ValueError(variant)
 
 
-def build_text(state: str, options: list[Option]) -> str:
+INPUT_MODES = ("official_labels", "described_text", "described_labels", "pairwise_descriptions")
+
+
+def build_text(state: str, options: list[Option], input_mode: str = "described_text") -> str:
     """Training-time description format is `label: description` joined by spaces, placed before/after the text.
     We always place it *before* the state so truncation (which cuts the tail) never removes option semantics."""
-    desc = " ".join(f"{o.label}: {o.description}" for o in options)
-    return f"{desc} {state}".strip()
+    if input_mode == "official_labels":
+        return state
+    if input_mode == "described_text":
+        desc = " ".join(f"{o.label}: {o.description}" for o in options)
+        return f"{desc} {state}".strip()
+    if input_mode in {"described_labels", "pairwise_descriptions"}:
+        return state
+    raise ValueError(f"unknown input mode: {input_mode}")
 
 
-def encode(rt: Runtime, views: list[tuple[str, str, list[Option]]]):
-    raws = [rt.pipe.prepare_input(build_text(state, opts), [o.label for o in opts], None, q or None)
+def model_labels(options: list[Option], input_mode: str) -> list[str]:
+    if input_mode in {"official_labels", "described_text"}:
+        return [o.label for o in options]
+    if input_mode in {"described_labels", "pairwise_descriptions"}:
+        return [o.description for o in options]
+    raise ValueError(f"unknown input mode: {input_mode}")
+
+
+def encode(rt: Runtime, views: list[tuple[str, str, list[Option]]], input_mode: str = "described_text"):
+    raws = [rt.pipe.prepare_input(build_text(state, opts, input_mode), model_labels(opts, input_mode), None, q or None)
             for q, state, opts in views]
     enc = rt.tokenizer(raws, truncation=True, max_length=MAX_LENGTH, padding="longest", return_tensors="pt")
     full = [len(x) for x in rt.tokenizer(raws, truncation=False)["input_ids"]]
@@ -79,8 +96,10 @@ def encode(rt: Runtime, views: list[tuple[str, str, list[Option]]]):
 
 
 @torch.no_grad()
-def score_batch(rt: Runtime, views: list[tuple[str, str, list[Option]]]) -> list[dict]:
-    enc, full_lens = encode(rt, views)
+def score_batch(rt: Runtime, views: list[tuple[str, str, list[Option]]], input_mode: str = "described_text") -> list[dict]:
+    if input_mode == "pairwise_descriptions":
+        return score_pairwise_batch(rt, views)
+    enc, full_lens = encode(rt, views, input_mode)
     n_max = max(len(v[2]) for v in views)
     logits = rt.model(**enc, max_num_classes=n_max).logits.float()
     out = []
@@ -92,17 +111,44 @@ def score_batch(rt: Runtime, views: list[tuple[str, str, list[Option]]]) -> list
     return out
 
 
-def run_items(rt: Runtime, items: list[Item], variant: str = "full", batch_size: int = 8) -> list[dict]:
+@torch.no_grad()
+def score_pairwise_batch(rt: Runtime, views: list[tuple[str, str, list[Option]]]) -> list[dict]:
+    """Score each option in isolation, then normalize its raw logit across that item's options.
+
+    This is deliberately an audit view, not a claim that the model learned a joint choice
+    distribution. Its value is removing candidate ordering and inter-option attention.
+    """
+    flat: list[tuple[int, tuple[str, str, list[Option]]]] = []
+    for item_idx, (question, state, options) in enumerate(views):
+        flat.extend((item_idx, (question, state, [option])) for option in options)
+    enc, full_lens = encode(rt, [view for _, view in flat], "pairwise_descriptions")
+    logits = rt.model(**enc, max_num_classes=1).logits[:, 0].float().cpu()
+    grouped: list[list[tuple[Option, float, int]]] = [[] for _ in views]
+    for (item_idx, (_, _, options)), logit, length, mask in zip(flat, logits, full_lens, enc["attention_mask"]):
+        grouped[item_idx].append((options[0], float(logit), length, int(mask.sum().item())))
+    out = []
+    for rows in grouped:
+        scores = torch.softmax(torch.tensor([row[1] for row in rows]), dim=0).tolist()
+        out.append({"probs": {row[0].id: score for row, score in zip(rows, scores)},
+                    "input_tokens": max(row[3] for row in rows),
+                    "full_tokens": max(row[2] for row in rows),
+                    "truncated": any(row[2] > MAX_LENGTH for row in rows)})
+    return out
+
+
+def run_items(rt: Runtime, items: list[Item], variant: str = "full", batch_size: int = 8,
+              input_mode: str = "described_text") -> list[dict]:
     """One prediction record per item; probabilities are keyed by stable option id, so reordering maps back."""
     recs = []
     for s in range(0, len(items), batch_size):
         chunk = items[s : s + batch_size]
         views = [variant_view(it, variant) for it in chunk]
-        for it, view, sc in zip(chunk, views, score_batch(rt, views)):
+        for it, view, sc in zip(chunk, views, score_batch(rt, views, input_mode)):
             probs = sc["probs"]
             assert all(math.isfinite(v) for v in probs.values()) and abs(sum(probs.values()) - 1) < 1e-4, it.id
             pred = max(probs, key=probs.get)
             recs.append({"item_id": it.id, "group_id": it.group_id, "family": it.family, "variant": variant,
+                         "input_mode": input_mode,
                          "presented_order": [o.id for o in view[2]], "probs": probs, "pred": pred, "gold": it.gold,
                          "correct": pred == it.gold, "confidence": probs[pred], **{k: sc[k] for k in
                          ("input_tokens", "full_tokens", "truncated")}})
